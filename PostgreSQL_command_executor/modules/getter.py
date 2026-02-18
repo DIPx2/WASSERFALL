@@ -187,10 +187,10 @@ def get_config_for_host(host_name: str = None):
     host_id, name = host_data
     
     # Собираем переменные в словари
-    cursor.execute("SELECT variable, value FROM ssh_variables WHERE id_host = ?;", (host_id,))
+    cursor.execute("SELECT variable, value FROM ssh_variables WHERE id_host = ? ;", (host_id,))
     ssh_vars = dict(cursor.fetchall())
     
-    cursor.execute("SELECT variable, value FROM postgre_variables WHERE id_host = ?;", (host_id,))
+    cursor.execute("SELECT variable, value FROM postgre_variables WHERE id_host = ? ;", (host_id,))
     pg_vars = dict(cursor.fetchall())
     
     conn.close()

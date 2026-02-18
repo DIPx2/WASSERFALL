@@ -58,12 +58,12 @@ def run_postgres_command_over_ssh(
     res = {"data": None, "stderr": err, "exit_code": exit_code}
 
     if exit_code == 0:
-    """
-    Если exit_code == 0: stdout парсится как JSON.
-    Если возникла ошибка: функция _parse_psql_error анализирует текст ошибки 
-    (например, "fatal", "syntax error") 
-    и возвращает внутренний код ошибки (например, pg_14, pg_16).
-    """
+        """
+        Если exit_code == 0: stdout парсится как JSON.
+        Если возникла ошибка: функция _parse_psql_error анализирует текст ошибки 
+        (например, "fatal", "syntax error") 
+        и возвращает внутренний код ошибки (например, pg_14, pg_16).
+        """
         try:
             res["data"] = json.loads(out) if out else []
             return res, "pg_0"
