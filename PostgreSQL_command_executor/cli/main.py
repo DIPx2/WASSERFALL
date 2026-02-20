@@ -1,164 +1,270 @@
+#!/usr/bin/env python3
+"""
+Оркестрация выполнения SQL-команд на удаленных хостах PostgreSQL.
+"""
 import sys
-import argparse
-import sqlite3
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Any, Optional
 
-ROOT = Path(__file__).resolve().parent.parent
+# === ДОБАВИТЬ КОРЕНЬ ПРОЕКТА В sys.path ===
+ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from modules.getter import get_ssh_connection, get_config_for_host, get_sql_template, get_sqlite_connection
+# === ИМПОРТ ОБЩИХ МОДУЛЕЙ ИЗ КОРНЯ ===
+from modules.getter import (
+    get_parse_args,
+    get_config_for_host,
+    get_sql_template,
+    get_all_active_hosts,
+    get_ssh_connection,
+)
 from modules.template_engine import render_sql
-from modules.db_postgres_runner import run_postgres_command_over_ssh
 from modules.logger import log_execution
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Wasserfall CLI: Parallel Mode")
-    parser.add_argument("--cmd", required=True, help="Имя SQL команды")
-    parser.add_argument("--host", help="Имя конкретного хоста (опционально)")
-    parser.add_argument("--workers", type=int, default=5, help="Количество параллельных потоков")
-    parser.add_argument("-v", "--var", action="append", help="Переменные шаблона key=value")
-    return parser.parse_args()
+# === ИМПОРТ PG-СПЕЦИФИЧНЫХ МОДУЛЕЙ ===
+from PostgreSQL_command_executor.modules.db_postgres_runner import (
+    run_postgres_command_over_ssh,
+    get_user_databases,
+)
 
-def get_all_active_hosts():
-    """Извлекает список всех активных хостов из БД."""
-    conn = sqlite3.connect(ROOT / "databases" / "wasserfall_config.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM hosts WHERE toggle = 1;")
-    hosts = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return hosts
+# === ГЛОБАЛЬНЫЕ ПУТИ (ОТНОСИТЕЛЬНО КОРНЯ) ===
+PATH_CONFIG_DB = ROOT / "databases" / "wasserfall_config.db"
+PATH_LOGGER_DB = ROOT / "databases" / "wasserfall_logger.db"
+
+
+def process_host(
+    host_name: str,
+    cmd_name: str,
+    template_vars: Dict[str, str],
+    target_dbs: Optional[List[str]],
+    exclude_dbs: Optional[List[str]],
+    allow_new_hosts: bool,
+) -> Dict[str, Any]:
+    """Обработать единственный хост."""
+    results = []
+    client = None
+    name = host_name
     
-# Обработка отдельного хоста (внутри потока)
-def process_single_host(hostname, command_name, template_vars):
     try:
-        # 1. Загрузка конфига для конкретного хоста
-        """
-        Функция get_config_for_host подключается к wasserfall_config.db и возвращает
-        два словаря переменных: cловарь SSH-переменных (ssh_vars) и 
-        словарь PostgreSQL-переменных (pg_vars)
-        """
-        
-# TODO: Надо в get_config_for_host обработчик ошибок + здесь
-# TODO: get_config_for_host: переработать запрос
-        _, ssh_v, pg_v = get_config_for_host(hostname)
-
-        """
-        Извлекает сырой текст SQL-запроса из таблицы sql_commands
-        """
-        raw_template = get_sql_template(command_name)
-        
-        """
-        Использует модуль template_engine.py, который использует библиотеку Jinja2
-        для подстановки переменных в шаблон. Если переменная отсутствует,
-        StrictUndefined вызовет ошибку.
-        """
-        final_sql = render_sql(raw_template, template_vars)
-
-        # 2. SSH-подключение
-        """
-        Создается SSH-client. В зависимости от настройки allow_new_hosts,
-        устанавливается политика AutoAddPolicy (доверять новым) или RejectPolicy (отклонять).
-        Происходит подключение к хосту. В случае ошибок (таймаут, auth fail) возвращается
-        соответствующий код ошибки (например, ssh_20).
-        """
-        client, ssh_code = get_ssh_connection(
-            username=ssh_v['SSH_USER'],
-            hostname=hostname,
-            key_path=ROOT / ssh_v['SSH_KEY_PATH'].lstrip('.\\'),
-            timeout=int(ssh_v['SSH_TIMEOUT']),
-            allow_new_hosts=(ssh_v['SSH_ALLOW_NEW_HOSTS'] == 'True')
+        name, ssh_vars, pg_vars = get_config_for_host(
+            host_name=host_name,
+            PATH_CONFIG_DB=str(PATH_CONFIG_DB)
         )
-
-        if client and ssh_code == "ssh_0": # SSH-соединение успешно
-            # 3. Выполнение команды PostgreSQL (db_postgres_runner.py)
+        
+        key_path_str = ssh_vars.get("SSH_KEY_PATH", "~/.ssh/id_ed25519")
+        key_path = Path(key_path_str)
+        
+        if not key_path.is_absolute():
+            test_path = ROOT / key_path
+            if test_path.exists():
+                key_path = test_path
+            else:
+                key_path = key_path.expanduser()
+        
+        username = ssh_vars.get("SSH_USER", "root")
+        timeout = int(ssh_vars.get("SSH_TIMEOUT", 10))
+        
+        client, ssh_code = get_ssh_connection(
+            username=username,
+            hostname=name,
+            key_path=key_path,
+            timeout=timeout,
+            allow_new_hosts=allow_new_hosts,
+        )
+        
+        if ssh_code != "ssh_0":
+            error_msg = "SSH Connection Failed: " + ssh_code
+            log_execution(
+                target_host=name,
+                query_text="SSH_ERROR: " + cmd_name,
+                result={"data": None, "stderr": error_msg, "exit_code": -1},
+                code=ssh_code,
+                logger_db_path=PATH_LOGGER_DB,
+                database_name=None
+            )
+            return {
+                "host": name,
+                "ssh_code": ssh_code,
+                "pg_code": None,
+                "error": error_msg,
+                "success": False
+            }
+        
+        if target_dbs:
+            databases = target_dbs
+        else:
+            databases = get_user_databases(client=client, pg_vars=pg_vars)
+        
+        if exclude_dbs and databases:
+            databases = [db for db in databases if db not in exclude_dbs]
+        
+        if not databases:
+            error_msg = "No databases to process"
+            log_execution(
+                target_host=name,
+                query_text="DB_LIST_ERROR: " + cmd_name,
+                result={"data": None, "stderr": error_msg, "exit_code": -1},
+                code="pg_99",
+                logger_db_path=PATH_LOGGER_DB,
+                database_name=None
+            )
+            return {
+                "host": name,
+                "ssh_code": "ssh_0",
+                "pg_code": "pg_99",
+                "error": error_msg,
+                "success": False
+            }
+        
+        try:
+            sql_template = get_sql_template(
+                command_name=cmd_name,
+                PATH_CONFIG_DB=str(PATH_CONFIG_DB)
+            )
+            rendered_sql = render_sql(
+                template_str=sql_template,
+                context=template_vars
+            )
+        except Exception as e:
+            error_msg = "Template Error: " + str(e)
+            log_execution(
+                target_host=name,
+                query_text="TEMPLATE_ERROR: " + cmd_name,
+                result={"data": None, "stderr": error_msg, "exit_code": -1},
+                code="pg_99",
+                logger_db_path=PATH_LOGGER_DB,
+                database_name=None
+            )
+            return {
+                "host": name,
+                "ssh_code": "ssh_0",
+                "pg_code": "pg_99",
+                "error": error_msg,
+                "success": False
+            }
+        
+        for db_name in databases:
             result, pg_code = run_postgres_command_over_ssh(
                 ssh_client=client,
-                sql=final_sql,
-                db_user=pg_v['PG_DB_USER'],
-                db_port=int(pg_v['PG_DB_PORT']),
-                db_name=pg_v['PG_DB_DEFAULT'],
-                psql_path=pg_v['PG_PSQL_PATH']
+                sql=rendered_sql,
+                db_user=pg_vars.get("PG_DB_USER", "postgres"),
+                db_name=db_name,
+                db_port=int(pg_vars.get("PG_DB_PORT", 5432)),
+                psql_path=pg_vars.get("PG_PSQL_PATH", "/usr/bin/psql"),
+                db_password=pg_vars.get("PG_PASSWORD", None),
             )
+            
+            log_execution(
+                target_host=name,
+                query_text=rendered_sql,
+                result=result,
+                code=pg_code,
+                logger_db_path=PATH_LOGGER_DB,
+                database_name=db_name
+            )
+            
+            results.append({
+                "database": db_name,
+                "pg_code": pg_code,
+                "exit_code": result.get("exit_code"),
+                "success": pg_code == "pg_0"
+            })
+        
+        all_success = all(r["success"] for r in results) if results else False
+        
+        return {
+            "host": name,
+            "ssh_code": "ssh_0",
+            "results": results,
+            "success": all_success,
+            "databases_processed": len(results),
+            "databases_failed": len([r for r in results if not r["success"]])
+        }
+    
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
 
-            # 4. Логирование
-            """
-            Результат выполнения (успех или ошибка) передается в log_execution.
-            Создается запись в таблице execution_tasks (хост, текст запроса).
-            Создается связанная запись в execution_results (код PG, код выхода, JSON-вывод, текст ошибки).
-            """
-            log_execution(hostname, final_sql, result, pg_code)
-            client.close()
-            return f"[{hostname}] Успешно: {pg_code}"
-        else:
-            return f"[{hostname}] Ошибка SSH: {ssh_code}"
-    except Exception as e:
-        return f"[{hostname}] Критическая ошибка: {e}"
 
 def main():
-    """
-    Скрипт ожидает следующие аргументы командной строки:
-    --cmd: Имя SQL-команды (обязательно).
-    --host: Имя конкретного хоста (опционально).
-    --workers: Количество потоков (по умолчанию 5).
-    --var: Переменные шаблона в формате key=value.
-    """
-    args = parse_args()
+    """Точка входа CLI."""
+    args = get_parse_args()
     
-    """
-    Обработка переменных шаблона.
-    Аргументы, переданные через --var, преобразуются в словарь template_vars. 
-    Строки разбиваются по первому знаку равенства.
-    """
-    template_vars = {item.split("=", 1)[0]: item.split("=", 1)[1] for item in (args.var or [])}
-
-    """
-    Выбор целей (хостов):
-    Если указан флаг --host, список целей (targets) состоит из одного этого хоста.
-    Если флаг отсутствует, вызывается функция get_all_active_hosts(). 
-    Она подключается к локальной базе wasserfall_config.db, выполняет запрос 
-    SELECT name FROM hosts WHERE toggle = 1 и возвращает список всех активных серверов.
-    """
+    template_vars = {}
+    if args.var:
+        for var in args.var:
+            if "=" in var:
+                key, value = var.split("=", 1)
+                template_vars[key.strip()] = value.strip()
+    
     if args.host:
-        targets = [args.host]
+        hosts = [args.host]
     else:
-        targets = get_all_active_hosts()
+        hosts = get_all_active_hosts(root=ROOT)
     
-    if not targets:
-        print("[!] Нет активных хостов для выполнения.")
+    if not hosts:
+        print("Нет активных хостов для обработки.")
         return
-
-    # print(f"Запуск параллельного выполнения на {len(targets)} хостах (потоков: {args.workers})...")
-
-    """
-    Запуск пула потоков:
-    Используется ThreadPoolExecutor с количеством воркеров, равным args.workers.
-    Распределение задач:
-    Для каждого хоста из списка targets создается задача (Future),
-    которая запускает функцию process_single_host. 
-    В эту функцию передаются три ключевых аргумента:
-    hostname: Имя целевого сервера.
-    command_name: Имя SQL-команды (из --cmd).
-    template_vars: Словарь переменных для подстановки.
-    """
+    
+    print("=" * 70)
+    print("Wasserfall: PostgreSQL Orchestration Engine")
+    print("=" * 70)
+    print("Хостов для обработки: " + str(len(hosts)))
+    print("Воркеров (потоков): " + str(args.workers))
+    print("Команда: " + args.cmd)
+    print("Переменные шаблона: " + str(template_vars) if template_vars else "Нет")
+    print("Базы данных: " + str(args.db) if args.db else "Все пользовательские")
+    print("Исключить базы: " + str(args.db_exclude) if args.db_exclude else "Нет")
+    print("=" * 70)
+    
+    success_count = 0
+    fail_count = 0
+    partial_count = 0
+    
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        # Формируем список задач
-        future_to_host = {executor.submit(process_single_host, h, args.cmd, template_vars): h for h in targets}
+        futures = {
+            executor.submit(
+                process_host,
+                host_name=host,
+                cmd_name=args.cmd,
+                template_vars=template_vars,
+                target_dbs=args.db,
+                exclude_dbs=args.db_exclude,
+                allow_new_hosts=args.allow_new_hosts,
+            ): host
+            for host in hosts
+        }
         
-        """
-        Главный поток main() перехватывает результаты через as_completed и выводит их в консоль.
-        Если возникло исключение, оно также выводится в stdout.
-        """
-        for future in as_completed(future_to_host):
-            host = future_to_host[future]
+        for future in as_completed(futures):
+            host = futures[future]
             try:
-                status = future.result() # Поток возвращает строковый статус
-                print(status)
+                result = future.result()
+                
+                if result.get("success"):
+                    print("[OK] " + host)
+                    success_count += 1
+                elif result.get("results"):
+                    db_success = len([r for r in result["results"] if r["success"]])
+                    db_total = len(result["results"])
+                    print("[PARTIAL] " + host + " - " + str(db_success) + "/" + str(db_total) + " БД успешно")
+                    partial_count += 1
+                else:
+                    print("[FAIL] " + host + " - " + str(result.get('error', 'Unknown error')))
+                    fail_count += 1
+                
             except Exception as e:
-                print(f"[{host}] Поток завершился с ошибкой: {e}")
+                print("[ERROR] " + host + " - " + str(e))
+                fail_count += 1
+    
+    print("=" * 70)
+    print("Завершено. Успешно: " + str(success_count) + ", Частично: " + str(partial_count) + ", Ошибок: " + str(fail_count))
+    print("=" * 70)
 
-# TODO: Модульность
 
 if __name__ == "__main__":
     main()
