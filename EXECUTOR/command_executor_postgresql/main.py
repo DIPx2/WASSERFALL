@@ -19,6 +19,14 @@ from typing import Dict, List, Any, Optional
 
 # Корневая директория проекта для корректного импорта внутренних модулей
 ROOT = Path(__file__).resolve().parent.parents[1]
+# ROOT = Path(__file__).resolve().parents[2]
+# ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+print (ROOT)
+
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
