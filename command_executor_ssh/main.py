@@ -1,9 +1,17 @@
-﻿import sys
+﻿# =============================================================================
+# Назначение: выполнять удалённые SSH-команды на одном или нескольких хостах
+# с использованием шаблонов команд, параметров окружения и централизованного
+# логирования результатов в SQLite. Обеспечивать параллельное выполнение,
+# контролируемую обработку ошибок и унифицированный вывод статусов.
+# =============================================================================
+
+import sys
 import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional
 
+# Определять корневую директорию проекта для корректного импорта внутренних модулей
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -18,11 +26,13 @@ from common.template_engine import render_sql
 from common.logger import log_execution
 from command_executor_ssh.modules.ssh_runner import run_ssh_command
 
+# Определять пути к конфигурационной и логирующей БД
 PATH_CONFIG_DB = ROOT / "databases" / "wasserfall_config.db"
 PATH_LOGGER_DB = ROOT / "databases" / "wasserfall_logger.db"
 
 
 def get_command_template(command_name: str) -> Optional[str]:
+    # Извлекать шаблон команды из таблицы commands по имени
     conn, code = get_sqlite_connection(PATH_CONFIG_DB)
     if conn is None:
         return None
@@ -32,6 +42,7 @@ def get_command_template(command_name: str) -> Optional[str]:
     row = cursor.fetchone()
     conn.close()
 
+    # Возвращать текст шаблона или None при отсутствии записи
     return row[0] if row else None
 
 
@@ -46,6 +57,7 @@ def process_host(
     dry_run: bool,
 ) -> Dict[str, Any]:
 
+    # Инициализировать структуру результата для унифицированного статуса выполнения
     result = {
         "host": host_name,
         "success": False,
@@ -59,11 +71,13 @@ def process_host(
     client = None
 
     try:
+        # Получать конфигурацию SSH и переменные окружения для хоста
         name, ssh_vars, pg_vars = get_config_for_host(
             host_name=host_name,
             PATH_CONFIG_DB=str(PATH_CONFIG_DB)
         )
 
+        # Определять путь к SSH-ключу с учётом относительных путей и $HOME
         key_path = Path(ssh_vars.get("SSH_KEY_PATH", "~/.ssh/id_ed25519"))
         if not key_path.is_absolute():
             key_path = (ROOT / key_path) if (ROOT / key_path).exists() else key_path.expanduser()
@@ -71,14 +85,17 @@ def process_host(
         username = ssh_vars.get("SSH_USER", "root")
         ssh_timeout = int(ssh_vars.get("SSH_TIMEOUT", 10))
 
+        # Рендерить шаблон команды с подстановкой переменных
         rendered_command = render_sql(command_template, template_vars)
 
+        # Выполнять режим dry-run без подключения к хосту
         if dry_run:
             result["success"] = True
             result["cmd_code"] = "cmd_0"
             result["stdout"] = f"[DRY-RUN] {rendered_command}"
             return result
 
+        # Устанавливать SSH-соединение с учётом политики known_hosts
         client, ssh_code = get_ssh_connection(
             username=username,
             hostname=name,
@@ -87,10 +104,13 @@ def process_host(
             allow_new_hosts=allow_new_hosts,
         )
 
+        # Обрабатывать ошибки подключения как явные состояния
         if ssh_code != "ssh_0":
             result["error"] = f"SSH error: {ssh_code}"
             result["cmd_code"] = ssh_code
             result["exit_code"] = -1
+
+            # Логировать неуспешное подключение
             log_execution(
                 target_host=name,
                 query_text=rendered_command,
@@ -101,6 +121,7 @@ def process_host(
             )
             return result
 
+        # Выполнять команду на удалённом хосте через SSH
         cmd_result, cmd_code = run_ssh_command(
             ssh_client=client,
             command=rendered_command,
@@ -109,12 +130,14 @@ def process_host(
             timeout=timeout,
         )
 
+        # Заполнять структуру результата данными выполнения
         result["cmd_code"] = cmd_code
         result["exit_code"] = cmd_result["exit_code"]
         result["stdout"] = cmd_result["stdout"]
         result["stderr"] = cmd_result["stderr"]
         result["success"] = cmd_code == "cmd_0"
 
+        # Логировать результат выполнения команды
         log_execution(
             target_host=name,
             query_text=rendered_command,
@@ -125,6 +148,7 @@ def process_host(
         )
 
     finally:
+        # Закрывать SSH-соединение при наличии клиента
         if client:
             try:
                 client.close()
@@ -135,6 +159,7 @@ def process_host(
 
 
 def parse_args() -> argparse.Namespace:
+    # Определять CLI-параметры для управления выполнением команд
     parser = argparse.ArgumentParser(
         description="SSH Command Executor — выполнение команд на удалённых хостах"
     )
@@ -154,6 +179,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def print_result(host: str, result: dict, verbose: bool) -> None:
+    # Определять отображаемые статусы для кодов выполнения
     STATUS_MAP = {
         "cmd_0": "OK",
         "ssh_0": "OK",
@@ -168,8 +194,10 @@ def print_result(host: str, result: dict, verbose: bool) -> None:
     status = STATUS_MAP.get(code, "UNKNOWN")
     exit_code = result.get("exit_code")
 
+    # Выводить краткий статус выполнения для хоста
     print(f"{host}: {status} ({code}, exit={exit_code})")
 
+    # Выводить stdout/stderr при включённом verbose
     if verbose:
         stdout = result.get("stdout") or ""
         stderr = result.get("stderr") or ""
@@ -183,10 +211,11 @@ def print_result(host: str, result: dict, verbose: bool) -> None:
             print(stderr)
 
 
-
 def main() -> int:
+    # Разбирать аргументы CLI
     args = parse_args()
 
+    # Формировать словарь переменных шаблона
     template_vars: Dict[str, str] = {}
     if args.var:
         for v in args.var:
@@ -194,16 +223,19 @@ def main() -> int:
                 k, val = v.split("=", 1)
                 template_vars[k.strip()] = val.strip()
 
+    # Получать шаблон команды или использовать прямую команду
     command_template = get_command_template(args.cmd)
     if command_template is None:
         print(f"Команда '{args.cmd}' не найдена в БД — выполняю как прямую команду")
         command_template = args.cmd
 
+    # Определять список хостов: один или все активные
     hosts = [args.host] if args.host else get_all_active_hosts(ROOT)
     if not hosts:
         print("Нет активных хостов")
         return 1
 
+    # Выводить сводную информацию перед выполнением
     print("SSH Command Executor")
     print("--------------------")
     print(f"Хостов: {len(hosts)}")
@@ -216,6 +248,7 @@ def main() -> int:
     fail = 0
     results: Dict[str, Dict[str, Any]] = {}
 
+    # Выполнять команды параллельно через пул потоков
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
@@ -232,6 +265,7 @@ def main() -> int:
             for h in hosts
         }
 
+        # Обрабатывать результаты по мере завершения задач
         for future in as_completed(futures):
             host = futures[future]
             try:
@@ -243,19 +277,21 @@ def main() -> int:
                 else:
                     fail += 1
 
-                # Управляемый вывод — можно отключить одной строкой
+                # Управляемый вывод результата
                 print_result(host, r, args.verbose)
 
             except Exception as e:
+                # Фиксировать исключения как ошибки выполнения
                 print(f"{host}: exception {str(e)}")
                 fail += 1
 
+    # Выводить итоговую статистику
     print()
     print("Итог:")
     print(f"Успешно: {success}")
     print(f"Ошибок: {fail}")
 
-    # Если один хост и не verbose — показать stdout отдельно
+    # Для одного хоста выводить stdout отдельно при отключённом verbose
     if len(hosts) == 1 and not args.verbose:
         r = results[hosts[0]]
         if r["success"] and r.get("stdout"):

@@ -1,18 +1,28 @@
+# =============================================================================
+# Модуль: main.py
+# Назначение: оркестрация выполнения SQL‑команд PostgreSQL на удалённых хостах
+# через SSH. Обеспечивает:
+#   - загрузку конфигурации хоста (SSH/PG‑параметры);
+#   - подключение по SSH с контролируемой моделью ошибок;
+#   - выбор целевых баз данных (все пользовательские или заданные);
+#   - рендеринг SQL‑шаблона с подстановкой переменных;
+#   - выполнение SQL‑команды по каждой БД через psql;
+#   - централизованное логирование результатов в SQLite;
+#   - параллельную обработку множества хостов;
+#   - унифицированный вывод статусов (OK / PARTIAL / FAIL).
+# =============================================================================
+
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional
 
-# ---------------------------------------------------------
-# Корень проекта
-# ---------------------------------------------------------
+# Корневая директория проекта для корректного импорта внутренних модулей
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# ---------------------------------------------------------
-# Импорты
-# ---------------------------------------------------------
+# Импорт вспомогательных модулей
 from common.getter import (
     get_config_for_host,
     get_ssh_connection,
@@ -29,36 +39,34 @@ from common.template_engine import render_sql
 from command_executor_postgresql.modules.postgres_runner import run_postgres_command_over_ssh
 from common.logger import log_execution
 
-# ---------------------------------------------------------
-# Пути к БД
-# ---------------------------------------------------------
+# Пути к конфигурационной и логирующей SQLite‑БД
 PATH_CONFIG_DB = ROOT / "databases" / "wasserfall_config.db"
 PATH_LOGGER_DB = ROOT / "databases" / "wasserfall_logger.db"
 
 
-# ---------------------------------------------------------
-# Форматированный вывод результата (единый стиль с SSH‑executor)
-# ---------------------------------------------------------
+# =============================================================================
+# Форматированный вывод результата выполнения SQL‑команды
+# =============================================================================
 def print_pg_result(host: str, result: Dict[str, Any], verbose: bool = False):
     """
-    Вывод результата выполнения SQL-команды на хосте.
-    Поддерживает:
-      - OK
-      - PARTIAL
-      - FAIL
+    Унифицированный вывод результата выполнения SQL‑команды.
+    Поддерживаемые состояния:
+      - OK       — все базы обработаны успешно;
+      - PARTIAL  — часть баз завершилась ошибкой;
+      - FAIL     — ошибка SSH, конфигурации или отсутствие результатов.
     """
 
-    # Ошибка SSH или конфигурации
+    # Ошибка SSH‑подключения или конфигурации
     if result.get("ssh_code") != "ssh_0":
         print(f"[FAIL] {host} - {result.get('error', 'SSH error')}")
         return
 
-    # Ошибка до выполнения SQL
+    # Ошибка до выполнения SQL (например, пустой список БД)
     if not result.get("results"):
         print(f"[FAIL] {host} - {result.get('error', 'Unknown error')}")
         return
 
-    # Все базы успешны
+    # Полный успех
     if result.get("success"):
         print(f"[OK] {host}")
         if verbose:
@@ -84,9 +92,9 @@ def print_pg_result(host: str, result: Dict[str, Any], verbose: bool = False):
         print(f"      Причина: {result['error']}")
 
 
-# ---------------------------------------------------------
-# Обработка одного хоста
-# ---------------------------------------------------------
+# =============================================================================
+# Обработка одного хоста: SSH → выбор БД → рендеринг SQL → выполнение
+# =============================================================================
 def process_host(
     host_name: str,
     cmd_name: str,
@@ -101,15 +109,16 @@ def process_host(
     name = host_name
 
     try:
-        # -----------------------------
-        # Конфигурация хоста
-        # -----------------------------
+        # ---------------------------------------------------------
+        # Загрузка конфигурации хоста (SSH/PG‑параметры)
+        # ---------------------------------------------------------
         try:
             name, ssh_vars, pg_vars = get_config_for_host(
                 host_name=host_name,
                 PATH_CONFIG_DB=str(PATH_CONFIG_DB),
             )
         except Exception as e:
+            # Ошибка конфигурации фиксируется как ssh_99
             error_msg = "CONFIG_ERROR: " + str(e)
             log_execution(
                 target_host=host_name,
@@ -127,12 +136,13 @@ def process_host(
                 "success": False,
             }
 
-        # -----------------------------
+        # ---------------------------------------------------------
         # SSH‑подключение
-        # -----------------------------
+        # ---------------------------------------------------------
         key_path_str = ssh_vars.get("SSH_KEY_PATH", "~/.ssh/id_ed25519")
         key_path = Path(key_path_str)
 
+        # Разрешение относительных путей и $HOME
         if not key_path.is_absolute():
             test_path = ROOT / key_path
             key_path = test_path if test_path.exists() else key_path.expanduser()
@@ -148,6 +158,7 @@ def process_host(
             allow_new_hosts=allow_new_hosts,
         )
 
+        # Ошибка SSH‑подключения фиксируется и возвращается как явное состояние
         if ssh_code != "ssh_0":
             error_msg = "SSH Connection Failed: " + ssh_code
             log_execution(
@@ -166,17 +177,19 @@ def process_host(
                 "success": False,
             }
 
-        # -----------------------------
-        # Список баз данных
-        # -----------------------------
+        # ---------------------------------------------------------
+        # Определение списка баз данных
+        # ---------------------------------------------------------
         if target_dbs:
             databases = target_dbs
         else:
             databases = get_user_databases(client=client, pg_vars=pg_vars)
 
+        # Исключение указанных БД
         if exclude_dbs and databases:
             databases = [db for db in databases if db not in exclude_dbs]
 
+        # Пустой список БД — ошибка pg_99
         if not databases:
             error_msg = "No databases to process"
             log_execution(
@@ -195,9 +208,9 @@ def process_host(
                 "success": False,
             }
 
-        # -----------------------------
+        # ---------------------------------------------------------
         # Рендеринг SQL‑шаблона
-        # -----------------------------
+        # ---------------------------------------------------------
         try:
             sql_template = get_sql_template(
                 command_name=cmd_name,
@@ -208,6 +221,7 @@ def process_host(
                 context=template_vars,
             )
         except Exception as e:
+            # Ошибка шаблона — pg_99
             error_msg = "Template Error: " + str(e)
             log_execution(
                 target_host=name,
@@ -225,9 +239,9 @@ def process_host(
                 "success": False,
             }
 
-        # -----------------------------
-        # Выполнение SQL по каждой БД
-        # -----------------------------
+        # ---------------------------------------------------------
+        # Выполнение SQL‑команды по каждой БД
+        # ---------------------------------------------------------
         for db_name in databases:
             result, pg_code = run_postgres_command_over_ssh(
                 ssh_client=client,
@@ -239,6 +253,7 @@ def process_host(
                 db_password=pg_vars.get("PG_PASSWORD", None),
             )
 
+            # Логирование результата выполнения SQL
             log_execution(
                 target_host=name,
                 query_text=rendered_sql,
@@ -256,6 +271,7 @@ def process_host(
                 "data": result.get("data"),
             })
 
+        # Итоговый статус: успех только если все БД успешны
         all_success = all(r["success"] for r in results) if results else False
 
         return {
@@ -268,6 +284,7 @@ def process_host(
         }
 
     finally:
+        # Закрытие SSH‑клиента при наличии
         if client:
             try:
                 client.close()
@@ -275,27 +292,28 @@ def process_host(
                 pass
 
 
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
+# =============================================================================
+# Точка входа: разбор аргументов, запуск пула потоков, вывод итогов
+# =============================================================================
 def main():
     args = get_parse_args()
     verbose = getattr(args, "verbose", False)
 
+    # Формирование словаря переменных шаблона
     template_vars: Dict[str, str] = {}
-
     if args.var:
         for var in args.var:
             if "=" in var:
                 key, value = var.split("=", 1)
                 template_vars[key.strip()] = value.strip()
 
+    # Определение списка хостов
     hosts = [args.host] if args.host else get_all_active_hosts(root=ROOT)
-
     if not hosts:
         print("Нет активных хостов для обработки.")
         return
 
+    # Информационный заголовок
     print("=" * 70)
     print("Wasserfall: PostgreSQL Orchestration Engine")
     print("=" * 70)
@@ -312,6 +330,7 @@ def main():
     fail_count = 0
     partial_count = 0
 
+    # Параллельная обработка хостов
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
@@ -326,6 +345,7 @@ def main():
             for host in hosts
         }
 
+        # Обработка результатов по мере завершения
         for future in as_completed(futures):
             host = futures[future]
             try:
@@ -343,6 +363,7 @@ def main():
                 print(f"[ERROR] {host} - {e}")
                 fail_count += 1
 
+    # Итоговая статистика
     print("=" * 70)
     print(f"Завершено. Успешно: {success_count}, Частично: {partial_count}, Ошибок: {fail_count}")
     print("=" * 70)
