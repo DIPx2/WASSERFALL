@@ -12,9 +12,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional
 
 # Определять корневую директорию проекта для корректного импорта внутренних модулей
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+print(ROOT)
 
 from common.getter import (
     get_ssh_connection,
@@ -24,7 +27,7 @@ from common.getter import (
 )
 from common.template_engine import render_sql
 from common.logger import log_execution
-from command_executor_ssh.modules.ssh_runner import run_ssh_command
+from EXECUTOR.command_executor_ssh.modules.ssh_runner import run_ssh_command
 
 # Определять пути к конфигурационной и логирующей БД
 PATH_CONFIG_DB = ROOT / "databases" / "wasserfall_config.db"

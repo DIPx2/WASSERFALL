@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional
 
 # Корневая директория проекта для корректного импорта внутренних модулей
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -29,14 +29,17 @@ from common.getter import (
     get_all_active_hosts,
 )
 
-from command_executor_postgresql.modules.getter import (
+from EXECUTOR.command_executor_postgresql.modules.getter import (
     get_parse_args,
     get_sql_template,
     get_user_databases,
 )
 
+from EXECUTOR.command_executor_postgresql.modules.postgres_runner import (
+    run_postgres_command_over_ssh,
+)
+
 from common.template_engine import render_sql
-from command_executor_postgresql.modules.postgres_runner import run_postgres_command_over_ssh
 from common.logger import log_execution
 
 # Пути к конфигурационной и логирующей SQLite‑БД
